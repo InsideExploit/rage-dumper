@@ -1,0 +1,848 @@
+#include "writer.hpp"
+#include "../../utils/console.hpp"
+#include "../../utils/version.hpp"
+
+#include <windows.h>
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
+
+static const char* repo = "https://github.com/InsideExploit/rage-dumper";
+
+struct cpp_type
+{
+    std::string base;
+    std::string dims;
+    uint64_t size = 0;
+    uint32_t align = 1;
+    std::string note;
+};
+
+struct sdk_ctx
+{
+    game_version version;
+    std::unordered_map<std::string, const struct_info*> structs;
+    std::unordered_map<std::string, std::string> struct_ids;
+    std::unordered_map<std::string, std::string> enum_ids;
+    std::unordered_map<std::string, uint32_t> enum_size;
+    std::unordered_set<std::string> done;
+    std::string out;
+    std::string asserts;
+};
+
+struct simple_type
+{
+    const char* name;
+    uint32_t size;
+    uint32_t align;
+};
+
+// indexed by parMemberType, sizes and alignment from the bank PDB
+static const simple_type simple_types[] =
+{
+    { "bool", 1, 1 }, { "int8_t", 1, 1 }, { "uint8_t", 1, 1 }, { "int16_t", 2, 2 },
+    { "uint16_t", 2, 2 }, { "int32_t", 4, 4 }, { "uint32_t", 4, 4 }, { "float", 4, 4 },
+    { "Vector2", 8, 4 }, { "Vector3", 16, 16 }, { "Vector4", 16, 16 },
+    {}, {}, {}, {}, {}, {},
+    { "Matrix34", 64, 16 }, { "Matrix44", 64, 16 }, { "Vec2V", 16, 16 }, { "Vec3V", 16, 16 },
+    { "Vec4V", 16, 16 }, { "Mat33V", 48, 16 }, { "Mat34V", 64, 16 }, { "Mat44V", 64, 16 },
+    { "ScalarV", 16, 16 }, { "BoolV", 16, 16 }, { "VecBoolV", 16, 16 }, { "ptrdiff_t", 8, 8 },
+    { "size_t", 8, 8 }, { "Float16", 2, 2 }, { "int64_t", 8, 8 }, { "uint64_t", 8, 8 },
+    { "double", 8, 8 },
+};
+
+static const char* basic_hpp = R"(#include <cstddef>
+#include <cstdint>
+
+// Every type here has its RAGE x64 size, padding is spelled out so the layout never depends on #pragma pack
+#pragma pack(push, 0x1)
+
+struct Vector2
+{
+	float x, y;
+};
+
+struct Vector3
+{
+	float x, y, z, w;
+};
+
+struct Vector4
+{
+	float x, y, z, w;
+};
+
+struct Vec2V
+{
+	float x, y, z, w;
+};
+
+struct Vec3V
+{
+	float x, y, z, w;
+};
+
+struct Vec4V
+{
+	float x, y, z, w;
+};
+
+struct ScalarV
+{
+	float x, y, z, w;
+};
+
+struct BoolV
+{
+	uint32_t x, y, z, w;
+};
+
+struct VecBoolV
+{
+	uint32_t x, y, z, w;
+};
+
+struct Mat33V
+{
+	Vec3V a, b, c;
+};
+
+struct Mat34V
+{
+	Vec3V a, b, c, d;
+};
+
+struct Mat44V
+{
+	Vec4V a, b, c, d;
+};
+
+struct Matrix34
+{
+	Vector3 a, b, c, d;
+};
+
+struct Matrix44
+{
+	Vector4 a, b, c, d;
+};
+
+struct Float16
+{
+	uint16_t bits;
+};
+
+// joaat of the string, the text itself is not kept in final builds
+struct atHashString
+{
+	uint32_t hash;
+};
+
+struct atFinalHashString
+{
+	uint32_t hash;
+};
+
+struct atHashValue
+{
+	uint32_t hash;
+};
+
+struct atPartialHashValue
+{
+	uint32_t hash;
+};
+
+struct atNsHashString
+{
+	uint32_t hash;
+};
+
+struct atNsHashValue
+{
+	uint32_t hash;
+};
+
+struct ConstString
+{
+	const char* data;
+};
+
+struct atString
+{
+	char* data;
+	uint16_t length;
+	uint16_t allocated;
+	uint8_t pad_000C[0x4];
+};
+
+struct atWideString
+{
+	wchar_t* data;
+	uint16_t length;
+	uint16_t allocated;
+	uint8_t pad_000C[0x4];
+};
+
+template <class T>
+struct atArray
+{
+	T* elements;
+	uint16_t count;
+	uint16_t capacity;
+	uint8_t pad_000C[0x4];
+};
+
+template <class T, uint32_t N>
+struct atFixedArray
+{
+	T elements[N];
+	int32_t count;
+};
+
+template <class T, uint32_t N>
+struct atRangeArray
+{
+	T elements[N];
+};
+
+template <uint32_t Bits, class W>
+struct atFixedBitSet
+{
+	W bits[(Bits + sizeof(W) * 8 - 1) / (sizeof(W) * 8)];
+};
+
+// field layout inside is not verified, only the size
+struct atBitSet
+{
+	uint8_t data[0x10];
+};
+
+template <class K, class V>
+struct atMap
+{
+	void* hash;
+	uint16_t slots;
+	uint16_t used;
+	uint8_t pad_000C[0x4];
+};
+
+// data points to an array of { K key; V value; } pairs kept sorted by key
+template <class K, class V>
+struct atBinaryMap
+{
+	bool sorted;
+	uint8_t pad_0001[0x7];
+	void* data;
+	uint16_t count;
+	uint16_t capacity;
+	uint8_t pad_0014[0x4];
+};
+
+#pragma pack(pop)
+)";
+
+static std::string fmt(const char* f, ...)
+{
+    va_list args;
+
+    va_start(args, f);
+    int n = vsnprintf(nullptr, 0, f, args);
+    va_end(args);
+
+    if (n <= 0)
+        return "";
+
+    std::string s(n, '\0');
+
+    va_start(args, f);
+    vsnprintf(s.data(), n + 1, f, args);
+    va_end(args);
+
+    return s;
+}
+
+static bool save(const std::wstring& path, const std::string& text)
+{
+    FILE* f = nullptr;
+
+    if (_wfopen_s(&f, path.c_str(), L"wb") || !f)
+    {
+        write_log(log_level::error, "cannot write %ls", path.c_str());
+        return false;
+    }
+
+    fwrite(text.data(), 1, text.size(), f);
+    fclose(f);
+    return true;
+}
+
+static std::string header_comment(const sdk_ctx& g, const char* file, const std::string& about)
+{
+    std::string s = "/*\n* " + g.version.product + " SDK\n*\n* Generated by rage-dumper\n* " + repo + "\n*\n";
+    s += "* Build: " + g.version.build + "\n* File:  " + file + "\n";
+
+    if (!about.empty())
+    {
+        s += "*\n";
+
+        for (size_t i = 0; i < about.size();)
+        {
+            auto e = about.find('\n', i);
+
+            if (e == std::string::npos)
+                e = about.size();
+
+            s += "* " + about.substr(i, e - i) + "\n";
+            i = e + 1;
+        }
+    }
+
+    s += "*/\n\n";
+    return s;
+}
+
+static std::string ident(const std::string& s)
+{
+    static const std::unordered_set<std::string> reserved =
+    {
+        "alignas", "alignof", "and", "asm", "auto", "bool", "break", "case", "catch", "char", "class", "const", "continue",
+        "default", "delete", "do", "double", "else", "enum", "explicit", "export", "extern", "false", "float", "for",
+        "friend", "goto", "if", "inline", "int", "long", "mutable", "namespace", "new", "not", "operator", "or", "private",
+        "protected", "public", "register", "return", "short", "signed", "sizeof", "static", "struct", "switch", "template",
+        "this", "throw", "true", "try", "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual", "void",
+        "volatile", "while", "xor", "min", "max", "small", "near", "far", "interface", "NULL", "TRUE", "FALSE", "IN", "OUT",
+        "OPTIONAL", "DELETE", "ERROR", "IGNORE", "INFINITE", "CONST", "VOID", "BOOL", "BYTE", "WORD", "DWORD",
+        "TRANSPARENT", "OPAQUE", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t",
+        "size_t", "ptrdiff_t", "wchar_t", "Vector2", "Vector3", "Vector4", "Vec2V", "Vec3V", "Vec4V", "ScalarV", "BoolV",
+        "VecBoolV", "Mat33V", "Mat34V", "Mat44V", "Matrix34", "Matrix44", "Float16", "atHashString", "atFinalHashString",
+        "atHashValue", "atPartialHashValue", "atNsHashString", "atNsHashValue", "ConstString", "atString", "atWideString",
+        "atArray", "atFixedArray", "atRangeArray", "atFixedBitSet", "atBitSet", "atMap", "atBinaryMap",
+    };
+
+    std::string r;
+
+    for (char c : s)
+    {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        r.push_back(ok ? c : '_');
+    }
+
+    if (r.empty() || (r[0] >= '0' && r[0] <= '9'))
+        r = "_" + r;
+
+    if (reserved.count(r))
+        r += "_";
+
+    return r;
+}
+
+static std::string unique(std::unordered_set<std::string>& used, const std::string& name)
+{
+    auto n = name;
+
+    for (int i = 2; used.count(n); i++)
+        n = name + "_" + std::to_string(i);
+
+    used.insert(n);
+    return n;
+}
+
+static cpp_type unknown(const std::string& note)
+{
+    return { "void", "", 0, 1, note };
+}
+
+static cpp_type spell(const sdk_ctx& g, const member_desc& d);
+
+static std::string arg(const cpp_type& t)
+{
+    return t.base + t.dims;
+}
+
+static cpp_type string_type(const member_desc& d)
+{
+    static const char* hashes[] =
+    {
+        "atHashString", "atFinalHashString", "atHashValue", "atPartialHashValue", "atNsHashString", "atNsHashValue",
+    };
+
+    auto n = d.count;
+
+    switch (d.subtype)
+    {
+    case 0: return n ? cpp_type{ "char", fmt("[%u]", n), n, 1 } : unknown("char[?]");
+    case 1: return { "char*", "", 8, 8 };
+    case 2: return { "ConstString", "", 8, 8 };
+    case 3: return { "atString", "", 16, 8 };
+    case 4: return n ? cpp_type{ "wchar_t", fmt("[%u]", n), n * 2ull, 2 } : unknown("wchar_t[?]");
+    case 5: return { "wchar_t*", "", 8, 8 };
+    case 6: return { "atWideString", "", 16, 8 };
+    }
+
+    if (d.subtype >= 7 && d.subtype <= 12)
+        return { hashes[d.subtype - 7], "", 4, 4 };
+
+    return unknown(fmt("string subtype %u", d.subtype));
+}
+
+static cpp_type struct_type(const sdk_ctx& g, const member_desc& d)
+{
+    auto it = g.structs.find(d.ref);
+
+    if (it == g.structs.end())
+        return d.subtype == 0 ? unknown("unregistered struct") : cpp_type{ "void*", "", 8, 8, "unregistered struct" };
+
+    auto id = "struct " + g.struct_ids.at(d.ref);
+
+    if (d.subtype == 0)
+        return { id, "", it->second->size, 1 };
+
+    return { id + "*", "", 8, 8 };
+}
+
+static cpp_type array_type(const sdk_ctx& g, const member_desc& d)
+{
+    auto e = d.sub.empty() ? unknown("?") : spell(g, d.sub[0]);
+    auto n = d.count;
+    auto et = arg(e);
+
+    switch (d.subtype)
+    {
+    case 0:
+        return { "atArray<" + et + ">", "", 16, 8, e.note };
+
+    case 1:
+        if (!e.size || !n)
+            return unknown(fmt("atFixedArray<%s, %u>", et.c_str(), n));
+
+        return { fmt("atFixedArray<%s, %u>", et.c_str(), n), "", n * e.size + 4, 4, e.note };
+
+    case 2:
+        if (!e.size || !n)
+            return unknown(fmt("atRangeArray<%s, %u>", et.c_str(), n));
+
+        return { fmt("atRangeArray<%s, %u>", et.c_str(), n), "", n * e.size, e.align, e.note };
+
+    case 3:
+    case 6:
+    case 7:
+    case 8:
+        return { e.dims.empty() ? e.base + "*" : std::string("void*"), "", 8, 8, e.note };
+
+    case 4:
+        if (!e.size || !n)
+            return unknown(fmt("%s[%u]", et.c_str(), n));
+
+        return { e.base, fmt("[%u]", n) + e.dims, n * e.size, e.align, e.note };
+
+    case 5:
+        return unknown("atArray<" + et + "> with 32-bit count");
+
+    case 9:
+        return unknown("virtual array of " + et);
+    }
+
+    return unknown(fmt("array subtype %u", d.subtype));
+}
+
+static cpp_type enum_type(const sdk_ctx& g, const member_desc& d)
+{
+    uint32_t size = d.subtype == 2 ? 1 : d.subtype == 1 ? 2 : 4;
+    const char* raw = size == 1 ? "uint8_t" : size == 2 ? "uint16_t" : "int32_t";
+
+    auto it = g.enum_size.find(d.ref);
+
+    if (it != g.enum_size.end() && it->second == size)
+        return { "enum " + g.enum_ids.at(d.ref), "", size, size };
+
+    return { raw, "", size, size, d.ref.empty() ? "unknown enum" : "enum " + d.ref };
+}
+
+static cpp_type bitset_type(const member_desc& d)
+{
+    auto note = d.ref.empty() ? std::string() : "bits of " + d.ref;
+
+    if (d.subtype == 3)
+        return { "atBitSet", "", 16, 8, note };
+
+    if (d.subtype > 2)
+        return unknown(fmt("bitset subtype %u", d.subtype));
+
+    uint32_t word = d.subtype == 0 ? 4 : d.subtype == 1 ? 2 : 1;
+    const char* wt = word == 4 ? "uint32_t" : word == 2 ? "uint16_t" : "uint8_t";
+
+    if (!d.count)
+        return unknown(fmt("atFixedBitSet<?, %s>", wt));
+
+    uint64_t words = (d.count + word * 8 - 1) / (word * 8);
+    return { fmt("atFixedBitSet<%u, %s>", d.count, wt), "", words * word, word, note };
+}
+
+static cpp_type map_type(const sdk_ctx& g, const member_desc& d)
+{
+    auto k = d.sub.size() > 0 ? spell(g, d.sub[0]) : unknown("?");
+    auto v = d.sub.size() > 1 ? spell(g, d.sub[1]) : unknown("?");
+    auto args = arg(k) + ", " + arg(v);
+
+    if (d.subtype == 1)
+        return { "atBinaryMap<" + args + ">", "", 24, 8 };
+
+    return { "atMap<" + args + ">", "", 16, 8 };
+}
+
+static cpp_type spell(const sdk_ctx& g, const member_desc& d)
+{
+    if (d.type < _countof(simple_types) && simple_types[d.type].name)
+    {
+        auto& s = simple_types[d.type];
+        return { s.name, "", s.size, s.align };
+    }
+
+    switch (d.type)
+    {
+    case type_string: return string_type(d);
+    case type_struct: return struct_type(g, d);
+    case type_array: return array_type(g, d);
+    case type_enum: return enum_type(g, d);
+    case type_bitset: return bitset_type(d);
+    case type_map: return map_type(g, d);
+    }
+
+    return unknown(d.type == type_invalid ? "unreadable member" : fmt("parser type %u", d.type));
+}
+
+static void value_deps(const member_desc& d, std::vector<std::string>& out)
+{
+    if (d.type == type_struct && d.subtype == 0 && !d.ref.empty())
+        out.push_back(d.ref);
+
+    if (d.type == type_array && (d.subtype == 1 || d.subtype == 2 || d.subtype == 4) && !d.sub.empty())
+        value_deps(d.sub[0], out);
+}
+
+struct row
+{
+    std::string text;
+    std::string name;
+    uint64_t offset;
+};
+
+static void struct_body(sdk_ctx& g, const struct_info* s)
+{
+    auto& id = g.struct_ids.at(s->name);
+    const struct_info* parent = nullptr;
+
+    if (!s->base.empty() && g.structs.count(s->base))
+        parent = g.structs.at(s->base);
+
+    bool inherit = parent && s->base_offset == 0 && parent->size && parent->size <= s->size &&
+        (s->fields.empty() || s->fields.front().offset >= parent->size);
+
+    uint64_t start = inherit ? parent->size : 0;
+    uint64_t cur = start;
+
+    std::unordered_set<std::string> used{ id };
+    std::vector<row> rows;
+
+    for (size_t i = 0; i < s->fields.size(); i++)
+    {
+        auto& f = s->fields[i];
+
+        if (f.offset < cur || f.offset >= s->size)
+        {
+            rows.push_back({ fmt("// 0x%04llX %s: overlaps the previous field", f.offset, f.name.c_str()), "", f.offset });
+            continue;
+        }
+
+        if (f.offset > cur)
+        {
+            auto pad = unique(used, fmt("pad_%04llX", cur));
+            rows.push_back({ fmt("uint8_t %s[0x%llX]; // 0x%04llX (0x%04llX)", pad.c_str(), f.offset - cur, cur, f.offset - cur), "", cur });
+        }
+
+        uint64_t next = s->size;
+
+        for (size_t j = i + 1; j < s->fields.size(); j++)
+        {
+            if (s->fields[j].offset > f.offset)
+            {
+                next = (std::min)(next, s->fields[j].offset);
+                break;
+            }
+        }
+
+        auto gap = next - f.offset;
+        auto t = spell(g, f.desc);
+        auto name = unique(used, ident(f.name));
+        auto note = t.note.empty() ? std::string() : " " + t.note;
+
+        // typed only when the guessed size fits before the next field and the offset is aligned for it
+        if (t.size && t.size <= gap && f.offset % t.align == 0)
+        {
+            rows.push_back({ fmt("%s %s%s; // 0x%04llX (0x%04llX)%s", t.base.c_str(), name.c_str(), t.dims.c_str(), f.offset, t.size, note.c_str()), name, f.offset });
+            cur = f.offset + t.size;
+        }
+        else
+        {
+            auto what = t.size ? arg(t) + note : t.note;
+            rows.push_back({ fmt("uint8_t %s[0x%llX]; // 0x%04llX (0x%04llX) %s", name.c_str(), gap, f.offset, gap, what.c_str()), name, f.offset });
+            cur = f.offset + gap;
+        }
+    }
+
+    if (s->size > cur)
+    {
+        auto pad = unique(used, fmt("pad_%04llX", cur));
+        rows.push_back({ fmt("uint8_t %s[0x%llX]; // 0x%04llX (0x%04llX)", pad.c_str(), s->size - cur, cur, s->size - cur), "", cur });
+    }
+
+    g.out += fmt("// Struct %s | Hash 0x%08X\n", s->name.c_str(), s->hash);
+    g.out += fmt("// 0x%04llX (0x%04llX - 0x%04llX)\n", s->size - start, s->size, start);
+    g.out += "struct " + id + (inherit ? " : public " + g.struct_ids.at(parent->name) : std::string()) + "\n{\n";
+
+    if (parent && !inherit)
+        g.out += "\t// Parent " + parent->name + " overlaps this layout, not inherited\n";
+
+    for (auto& r : rows)
+        g.out += "\t" + r.text + "\n";
+
+    g.out += "};\n\n";
+
+    if (!s->size)
+        return;
+
+    g.asserts += "// Struct " + s->name + "\n";
+    g.asserts += fmt("static_assert(sizeof(%s) == 0x%06llX, \"Wrong size on %s\");\n", id.c_str(), s->size, s->name.c_str());
+
+    for (auto& r : rows)
+    {
+        if (!r.name.empty())
+        {
+            g.asserts += fmt("static_assert(offsetof(%s, %s) == 0x%06llX, \"Member '%s::%s' has a wrong offset!\");\n",
+                id.c_str(), r.name.c_str(), r.offset, s->name.c_str(), r.name.c_str());
+        }
+    }
+
+    g.asserts += "\n";
+}
+
+// parents and by-value members first, so every struct is complete where it is used
+static void emit_struct(sdk_ctx& g, const struct_info* s)
+{
+    if (g.done.count(s->name))
+        return;
+
+    g.done.insert(s->name);
+
+    if (!s->base.empty() && g.structs.count(s->base))
+        emit_struct(g, g.structs.at(s->base));
+
+    std::vector<std::string> deps;
+
+    for (auto& f : s->fields)
+        value_deps(f.desc, deps);
+
+    for (auto& d : deps)
+    {
+        if (g.structs.count(d))
+            emit_struct(g, g.structs.at(d));
+    }
+
+    struct_body(g, s);
+}
+
+static const char* enum_base(const enum_info& e, uint32_t& size)
+{
+    int32_t lo = 0;
+    int32_t hi = 0;
+
+    for (auto& [name, v] : e.values)
+    {
+        lo = (std::min)(lo, v);
+        hi = (std::max)(hi, v);
+    }
+
+    size = e.size;
+
+    if (size == 1 && lo >= -128 && hi <= 127)
+        return "int8_t";
+
+    if (size == 1 && lo >= 0 && hi <= 255)
+        return "uint8_t";
+
+    if (size == 2 && lo >= -32768 && hi <= 32767)
+        return "int16_t";
+
+    if (size == 2 && lo >= 0 && hi <= 65535)
+        return "uint16_t";
+
+    size = 4;
+    return "int32_t";
+}
+
+static std::string enums_hpp(sdk_ctx& g, const sdk_model& m)
+{
+    std::string s = "#pragma once\n\n" + header_comment(g, "Enums.hpp",
+        "Every enum used by a parser structure. Enums used by bitsets hold bit indices, not masks.");
+
+    s += "#include <cstdint>\n\n";
+
+    for (auto& e : m.enums)
+    {
+        uint32_t size = 4;
+        auto base = enum_base(e, size);
+
+        g.enum_size[e.name] = size;
+
+        s += fmt("// Enum %s | Hash 0x%08X | Size 0x%X%s\n", e.name.c_str(), e.hash, size, e.bits ? " | Bit indices" : "");
+        s += "enum class " + g.enum_ids.at(e.name) + " : " + base + "\n{\n";
+
+        std::unordered_set<std::string> used;
+
+        for (auto& [name, v] : e.values)
+            s += fmt("\t%s = %d,\n", unique(used, ident(name)).c_str(), v);
+
+        s += "};\n\n";
+    }
+
+    return s;
+}
+
+static std::string classes_hpp(sdk_ctx& g, const sdk_model& m)
+{
+    g.out = "#pragma once\n\n" + header_comment(g, "Classes.hpp",
+        "Every structure registered with the RAGE parser (parManager). Field comments are offset (size).\n"
+        "A field whose layout could not be confirmed is a byte array with the parser type in its comment.\n"
+        "Everything is pack(1) with explicit padding, layout checks are in Asserts.hpp.");
+
+    g.out += "#include \"Basic.hpp\"\n#include \"Enums.hpp\"\n\n#pragma pack(push, 0x1)\n\n";
+
+    for (auto& s : m.structs)
+        g.out += "struct " + g.struct_ids.at(s.name) + ";\n";
+
+    g.out += "\n";
+
+    for (auto& s : m.structs)
+        emit_struct(g, &s);
+
+    g.out += "#pragma pack(pop)\n";
+    return g.out;
+}
+
+bool write_sdk(const sdk_model& m, const std::wstring& dir)
+{
+    sdk_ctx g;
+    g.version = get_game_version();
+
+    std::unordered_set<std::string> used;
+
+    for (auto& s : m.structs)
+    {
+        g.structs[s.name] = &s;
+        g.struct_ids[s.name] = unique(used, ident(s.name));
+    }
+
+    for (auto& e : m.enums)
+    {
+        if (!g.enum_ids.count(e.name))
+            g.enum_ids[e.name] = unique(used, ident(e.name));
+    }
+
+    CreateDirectoryW(dir.c_str(), nullptr);
+
+    auto enums = enums_hpp(g, m);
+    auto classes = classes_hpp(g, m);
+
+    auto basic = "#pragma once\n\n" + header_comment(g, "Basic.hpp", "RAGE core types used by Classes.hpp.") + basic_hpp;
+
+    auto asserts = "#pragma once\n\n" + header_comment(g, "Asserts.hpp",
+        "Size and member offset checks for Classes.hpp.\nInclude it in one translation unit.");
+
+    asserts += "#include <cstddef>\n#include \"Classes.hpp\"\n\n" + g.asserts;
+
+    std::string missing;
+
+    for (auto h : m.missing)
+        missing += fmt("%08X\n", h);
+
+    bool ok = save(dir + L"Basic.hpp", basic) && save(dir + L"Enums.hpp", enums) &&
+        save(dir + L"Classes.hpp", classes) && save(dir + L"Asserts.hpp", asserts) && save(dir + L"Unresolved.txt", missing);
+
+    if (ok)
+    {
+        write_log(log_level::ok, "%s %s: %zu structs, %zu enums", g.version.product.c_str(), g.version.build.c_str(), m.structs.size(), m.enums.size());
+        write_log(log_level::ok, "SDK written to %ls", dir.c_str());
+    }
+
+    return ok;
+}
+
+bool write_natives(const std::vector<native_info>& natives, const std::wstring& dir)
+{
+    sdk_ctx g;
+    g.version = get_game_version();
+
+    auto s = "#pragma once\n\n" + header_comment(g, "Natives.hpp",
+        "Every script native in the command table, grouped by namespace. Offsets are from the game module base.\n"
+        "handler: the registered entry, the address to call or hook. Arxan turns its first bytes into a jump.\n"
+        "body:    first real instruction of the native once the Arxan jumps are folded, the code is still split\n"
+        "         into chunks joined by hidden jumps.\n"
+        "command: the separate command function the body calls, 0 when the compiler inlined it into the body.\n"
+        "The comment holds the original hash native databases are keyed by.\n"
+        "Names come from natives.txt (FiveM crossmap + bank build names).");
+
+    s += "#include <cstdint>\n\nstruct native_entry\n{\n\tuint64_t hash;\n\tuint32_t handler;\n\tuint32_t body;\n\tuint32_t command;\n};\n\n";
+
+    std::vector<const native_info*> list;
+
+    for (auto& n : natives)
+        list.push_back(&n);
+
+    // named natives by namespace and name, the unnamed ones last
+    std::sort(list.begin(), list.end(), [](auto a, auto b)
+    {
+        if (a->name.empty() != b->name.empty())
+            return b->name.empty();
+
+        if (a->ns != b->ns)
+            return a->ns < b->ns;
+
+        return a->name != b->name ? a->name < b->name : a->hash < b->hash;
+    });
+
+    std::unordered_set<std::string> used;
+    std::string group = "\x01";
+
+    for (auto n : list)
+    {
+        auto ns = n->name.empty() ? std::string("UNKNOWN") : n->ns.empty() ? std::string("OTHER") : n->ns;
+
+        if (ns != group)
+        {
+            if (group != "\x01")
+                s += "\n";
+
+            s += "// Namespace " + ns + "\n";
+            group = ns;
+        }
+
+        auto name = unique(used, ident(n->name.empty() ? fmt("_0x%016llX", n->hash) : n->name));
+        s += fmt("inline constexpr native_entry %s{ 0x%016llX, 0x%08llX, 0x%08llX, 0x%08llX };", name.c_str(), n->hash, n->handler, n->body, n->command);
+
+        if (n->original)
+            s += fmt(" // 0x%016llX", n->original);
+
+        s += "\n";
+    }
+
+    CreateDirectoryW(dir.c_str(), nullptr);
+
+    if (!save(dir + L"Natives.hpp", s))
+        return false;
+
+    write_log(log_level::ok, "Natives.hpp written");
+    return true;
+}
